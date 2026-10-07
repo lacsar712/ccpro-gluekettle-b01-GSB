@@ -24,6 +24,17 @@ class Workshop(SQLModel, table=True):
     kettles: list["Kettle"] = Relationship(back_populates="workshop")
 
 
+class AlleyConfig(SQLModel, table=True):
+    """每条巷的「熬煮中」并存上限与启用开关。"""
+
+    __tablename__ = "alley_config"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    alley: str = Field(unique=True, index=True)
+    cap: int = 2
+    enabled: bool = True
+
+
 class Kettle(SQLModel, table=True):
     STATUS_COLD: ClassVar[str] = "cold"
     STATUS_BOILING: ClassVar[str] = "boiling"
@@ -34,6 +45,7 @@ class Kettle(SQLModel, table=True):
     code: str
     status: str = STATUS_COLD
     bench: int = 0
+    alley: str = "西巷"
     workshop: Optional[Workshop] = Relationship(back_populates="kettles")
     cooks: list["CookLog"] = Relationship(back_populates="kettle")
 
