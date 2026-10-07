@@ -4,14 +4,15 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+from sqlalchemy import func
 from sqlalchemy.orm import selectinload
 from sqlmodel import SQLModel, select
 
 from app.db import engine, get_session
-from app.domain import RuleError, assert_can_set_status, latest_peak
-from app.models import CookLog, Kettle, User, Workshop
+from app.domain import RuleError, assert_alley_has_room, assert_can_set_status, latest_peak
+from app.models import AlleyConfig, CookLog, Kettle, User, Workshop
 from app.security import make_token, parse_token, verify_password
-from app.seed import seed_demo
+from app.seed import migrate, seed_demo
 
 
 async def current_user(request: Request) -> User | None:
@@ -37,9 +38,26 @@ def kettle_json(kettle: Kettle) -> dict:
         "code": kettle.code,
         "status": kettle.status,
         "bench": kettle.bench,
+        "alley": kettle.alley,
         "latestPeakC": latest_peak(kettle),
         "cookCount": len(kettle.cooks or []),
     }
+
+
+def alley_rows(session) -> list[dict]:
+    """按巷给出上限、开关与当前占用；占用实时数真实熬煮中锅数。"""
+    configs = session.exec(select(AlleyConfig).order_by(AlleyConfig.alley)).all()
+    counts = dict(
+        session.exec(
+            select(Kettle.alley, func.count())
+            .where(Kettle.status == Kettle.STATUS_BOILING)
+            .group_by(Kettle.alley)
+        ).all()
+    )
+    return [
+        {"alley": c.alley, "cap": c.cap, "enabled": c.enabled, "used": int(counts.get(c.alley, 0))}
+        for c in configs
+    ]
 
 
 async def health(request: Request):
@@ -83,6 +101,40 @@ async def board(request: Request):
         )
 
 
+async def list_alleys(request: Request):
+    user = await current_user(request)
+    if user is None:
+        return JSONResponse({"detail": "未登录"}, status_code=401)
+    with get_session() as session:
+        return JSONResponse({"alleys": alley_rows(session)})
+
+
+async def update_alley(request: Request):
+    user = await current_user(request)
+    if user is None:
+        return JSONResponse({"detail": "未登录"}, status_code=401)
+    if user.role != "admin":
+        return JSONResponse({"detail": "仅管理员可改巷口并存"}, status_code=403)
+    alley = request.path_params["alley"]
+    body = await request.json()
+    with get_session() as session:
+        config = session.exec(select(AlleyConfig).where(AlleyConfig.alley == alley)).first()
+        if config is None:
+            return JSONResponse({"detail": "巷不存在"}, status_code=404)
+        if "cap" in body:
+            cap = body["cap"]
+            if isinstance(cap, bool) or not isinstance(cap, (int, float)) or int(cap) != cap or int(cap) < 1:
+                return JSONResponse({"detail": "上限必须是正整数"}, status_code=400)
+            config.cap = int(cap)
+        if "enabled" in body:
+            if not isinstance(body["enabled"], bool):
+                return JSONResponse({"detail": "开关必须是布尔值"}, status_code=400)
+            config.enabled = body["enabled"]
+        session.add(config)
+        session.commit()
+        return JSONResponse({"alleys": alley_rows(session)})
+
+
 async def add_cook(request: Request):
     user = await current_user(request)
     if user is None:
@@ -109,15 +161,29 @@ async def set_status(request: Request):
         return JSONResponse({"detail": "未登录"}, status_code=401)
     kettle_id = int(request.path_params["kettle_id"])
     body = await request.json()
+    new_status = body.get("status", "")
     with get_session() as session:
         kettle = load_kettle(session, kettle_id)
         if kettle is None:
             return JSONResponse({"detail": "锅不存在"}, status_code=404)
         try:
-            assert_can_set_status(kettle, body.get("status", ""))
+            assert_can_set_status(kettle, new_status)
+            if new_status == Kettle.STATUS_BOILING and kettle.status != Kettle.STATUS_BOILING:
+                # 锁住该巷配置行，核对与落库同事务，两人同抢也只能一个过一个挡
+                config = session.exec(
+                    select(AlleyConfig).where(AlleyConfig.alley == kettle.alley).with_for_update()
+                ).first()
+                if config is not None and config.enabled:
+                    used = session.exec(
+                        select(func.count(Kettle.id)).where(
+                            Kettle.alley == kettle.alley,
+                            Kettle.status == Kettle.STATUS_BOILING,
+                        )
+                    ).one()
+                    assert_alley_has_room(kettle.alley, config.cap, used)
         except RuleError as exc:
             return JSONResponse({"detail": str(exc)}, status_code=400)
-        kettle.status = body.get("status")
+        kettle.status = new_status
         session.add(kettle)
         session.commit()
         kettle = load_kettle(session, kettle_id)
@@ -126,6 +192,7 @@ async def set_status(request: Request):
 
 def init() -> None:
     SQLModel.metadata.create_all(engine)
+    migrate()
     seed_demo()
 
 
@@ -137,6 +204,8 @@ app = Starlette(
         Route("/api/auth/login", login, methods=["POST"]),
         Route("/api/auth/me", me),
         Route("/api/board", board),
+        Route("/api/alleys", list_alleys),
+        Route("/api/alleys/{alley}", update_alley, methods=["PUT"]),
         Route("/api/kettles/{kettle_id:int}/cooks", add_cook, methods=["POST"]),
         Route("/api/kettles/{kettle_id:int}/status", set_status, methods=["POST"]),
     ],

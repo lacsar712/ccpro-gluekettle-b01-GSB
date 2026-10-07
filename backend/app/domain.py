@@ -1,4 +1,4 @@
-"""熬锅出胶门槛：最近一次煮胶峰值温度须 ≥ 90℃。"""
+"""熬锅出胶门槛：最近一次煮胶峰值温度须 ≥ 90℃；巷口熬煮中并存上限。"""
 
 from app.models import Kettle
 
@@ -27,3 +27,9 @@ def assert_can_set_status(kettle: Kettle, new_status: str) -> None:
         raise RuleError("该锅尚无煮胶峰值，不能出胶")
     if peak < MIN_PEAK:
         raise RuleError(f"最近峰值 {peak}℃ 低于 {MIN_PEAK:.0f}℃，不能出胶")
+
+
+def assert_alley_has_room(alley: str, cap: int, used: int) -> None:
+    """开关开着且该巷已顶格时，挡住再把锅拨成熬煮中。登峰值、标已出胶不读此限。"""
+    if used >= cap:
+        raise RuleError(f"{alley}熬煮中已达并存上限 {cap} 口（当前 {used} 口在熬），不能再拨")
